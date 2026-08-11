@@ -1,5 +1,5 @@
 discord.py
-openai
+groq
 aiosqlite
 psutil
 Pillow
