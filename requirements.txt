@@ -2,3 +2,5 @@ discord.py
 google-genai
 python-dotenv
 aiosqlite
+psutil
+Pillow
