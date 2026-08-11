@@ -22,7 +22,7 @@ logger = logging.getLogger("ChatGPTBotEngine")
 # CONFIGURATION & ENVIRONMENT VARIABLES
 # -------------------------------------------------------------------
 # Replace with your actual Discord User ID to grant Bot Owner privileges
-BOT_OWNER_ID = 123456789012345678  
+BOT_OWNER_ID =  1534648675098431499
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
