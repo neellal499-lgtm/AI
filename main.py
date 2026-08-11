@@ -1,11 +1,14 @@
 import os
+import io
 import time
 import asyncio
 import logging
 import itertools
 import aiosqlite
+import psutil
 import discord
 from discord.ext import commands, tasks
+from PIL import Image
 from google import genai
 from google.genai import types
 
@@ -16,16 +19,18 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] [%(name)s] %(message)s"
 )
-logger = logging.getLogger("ChatBotCore")
+logger = logging.getLogger("ChatBotMain")
 
 # -------------------------------------------------------------------
 # CONFIGURATION & CONSTANTS
 # -------------------------------------------------------------------
-BOT_OWNER_ID = 123456789012345678  # <--- Replace with your Discord User ID
+# Replace with your actual Discord User ID
+BOT_OWNER_ID = 123456789012345678  
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+IMAGE_MODEL_NAME = "imagen-3.0-generate-002"
 DB_NAME = "commands.db"
 
 SYSTEM_INSTRUCTION = """
@@ -36,90 +41,91 @@ STRICT MANDATE:
 3. Be helpful, concise, and professional in all general queries.
 """
 
-# Secret keyword interceptors to protect AI provider details
 SECRET_KEYWORDS = [
     "api key", "which api", "what model", "what api", "who owns you",
     "who created you", "who made you", "your developer", "gemini", "google api"
 ]
 
 # -------------------------------------------------------------------
-# CORE BOT CLASS ENGINE
+# BOT INITIALIZATION & SETUP
 # -------------------------------------------------------------------
-class AdvancedChatBot(commands.Bot):
-    def __init__(self):
-        intents = discord.Intents.default()
-        intents.message_content = True
-        intents.members = True
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
 
-        super().__init__(
-            command_prefix=commands.when_mentioned,
-            intents=intents,
-            help_command=None
-        )
+bot = commands.Bot(
+    command_prefix=commands.when_mentioned,
+    intents=intents,
+    help_command=None
+)
 
-        self.start_time = time.time()
-        self.processed_messages = 0
-        self.user_memory = {}
-        self.max_memory_turns = 6
+BOT_START_TIME = time.time()
+PROCESSED_MESSAGES_COUNT = 0
+USER_MEMORY = {}
+MAX_MEMORY_TURNS = 6
 
-        # Initialize AI Client
-        self.ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+# Initialize Gemini Client
+ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
-        # Activity Rotation Pool (Rotates every 5 seconds)
-        self.status_pool = itertools.cycle([
-            discord.Activity(type=discord.ActivityType.listening, name="@ChatBot ask me anything!"),
-            discord.Activity(type=discord.ActivityType.playing, name="with Custom AI Engine 🤖"),
-            discord.Activity(type=discord.ActivityType.watching, name="for mentions in chat 👀"),
-            discord.Activity(type=discord.ActivityType.listening, name="@ChatBot reset to clear memory 🧹"),
-            discord.Activity(type=discord.ActivityType.competing, name="24/7 Railway Server ⚡")
-        ])
+# Activity pool (rotates every 5 seconds)
+STATUS_MESSAGES = itertools.cycle([
+    discord.Activity(type=discord.ActivityType.listening, name="@ChatBot ask me anything!"),
+    discord.Activity(type=discord.ActivityType.playing, name="with Custom AI Engine 🤖"),
+    discord.Activity(type=discord.ActivityType.watching, name="for mentions in chat 👀"),
+    discord.Activity(type=discord.ActivityType.listening, name="@ChatBot reset to clear memory 🧹"),
+    discord.Activity(type=discord.ActivityType.competing, name="24/7 Railway Server ⚡")
+])
 
-    async def setup_hook(self):
-        """Called automatically before the bot connects to Discord."""
-        await self.init_database()
-        self.rotate_presence.start()
-        logger.info("Bot infrastructure successfully hooked and ready.")
 
-    async def init_database(self):
-        """Ensures SQLite tables exist."""
-        async with aiosqlite.connect(DB_NAME) as db:
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS custom_commands (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    server_id INTEGER,
-                    trigger TEXT,
-                    response_title TEXT,
-                    response_description TEXT,
-                    required_permission TEXT,
-                    is_global INTEGER DEFAULT 0
-                )
-            """)
-            await db.commit()
-        logger.info("SQLite Database initialized successfully.")
+async def init_db():
+    """Creates SQLite database tables if they do not exist."""
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS custom_commands (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                server_id INTEGER,
+                trigger TEXT,
+                response_title TEXT,
+                response_description TEXT,
+                required_permission TEXT,
+                is_global INTEGER DEFAULT 0
+            )
+        """)
+        await db.commit()
+    logger.info("SQLite Database initialized successfully.")
 
-    @tasks.loop(seconds=5)
-    async def rotate_presence(self):
-        """Background task rotating Discord status every 5 seconds."""
-        await self.change_presence(activity=next(self.status_pool))
 
-    @rotate_presence.before_loop
-    async def before_rotate(self):
-        await self.wait_until_ready()
+@tasks.loop(seconds=5)
+async def change_status():
+    """Background task rotating presence every 5 seconds."""
+    await bot.change_presence(activity=next(STATUS_MESSAGES))
 
-# Initialize Bot Instance
-bot = AdvancedChatBot()
 
-# -------------------------------------------------------------------
-# EVENT HANDLERS
-# -------------------------------------------------------------------
 @bot.event
 async def on_ready():
-    logger.info(f"✅ Bot initialized as {bot.user} (ID: {bot.user.id})")
-    logger.info(f"🔗 Connected to {len(bot.guilds)} server(s).")
+    await init_db()
+    await bot.tree.sync()
+    logger.info(f"✅ Bot logged in as {bot.user} (ID: {bot.user.id})")
+    if not change_status.is_running():
+        change_status.start()
 
 
+# -------------------------------------------------------------------
+# NATIVE SLASH COMMANDS
+# -------------------------------------------------------------------
+@bot.tree.command(name="ping", description="Check the gateway latency")
+async def ping_slash(interaction: discord.Interaction):
+    latency = round(bot.latency * 1000)
+    await interaction.response.send_message(f"🏓 Pong! Gateway latency: `{latency}ms`")
+
+
+# -------------------------------------------------------------------
+# MAIN MESSAGE LISTENER
+# -------------------------------------------------------------------
 @bot.event
 async def on_message(message: discord.Message):
+    global PROCESSED_MESSAGES_COUNT
+
     if message.author.bot:
         return
 
@@ -134,6 +140,7 @@ async def on_message(message: discord.Message):
             commands_list = await cursor.fetchall()
             for trigger, title, description, req_perm in commands_list:
                 if message.content.lower().startswith(trigger.lower()):
+                    # Check required execution permissions
                     if req_perm and req_perm != "none" and isinstance(message.author, discord.Member):
                         perm_attr = getattr(message.author.guild_permissions, req_perm, False)
                         if not perm_attr and message.author.id != BOT_OWNER_ID:
@@ -159,7 +166,7 @@ async def on_message(message: discord.Message):
 
     # 2. DIRECT BOT MENTION INTERCEPTOR
     if bot.user in message.mentions:
-        bot.processed_messages += 1
+        PROCESSED_MESSAGES_COUNT += 1
 
         raw_prompt = (
             message.content.replace(f"<@{bot.user.id}>", "")
@@ -170,18 +177,113 @@ async def on_message(message: discord.Message):
         user_id = message.author.id
         lower_prompt = raw_prompt.lower()
 
-        # A. Secrecy Interceptor
+        # A. System Metrics Check (@ChatBot check / @ChatBot stats)
+        if lower_prompt in ["check", "system check", "stats", "status"]:
+            cpu_usage = psutil.cpu_percent(interval=1)
+            cpu_count = psutil.cpu_count(logical=True)
+
+            ram = psutil.virtual_memory()
+            ram_used_mb = round(ram.used / (1024 * 1024), 2)
+            ram_total_mb = round(ram.total / (1024 * 1024), 2)
+            ram_percent = ram.percent
+
+            disk = psutil.disk_usage('/')
+            disk_used_gb = round(disk.used / (1024 * 1024 * 1024), 2)
+            disk_total_gb = round(disk.total / (1024 * 1024 * 1024), 2)
+            disk_percent = disk.percent
+
+            uptime_seconds = int(time.time() - BOT_START_TIME)
+            hours, remainder = divmod(uptime_seconds, 3600)
+            minutes, seconds = divmod(remainder, 60)
+
+            async with aiosqlite.connect(DB_NAME) as db:
+                async with db.execute("SELECT COUNT(*) FROM custom_commands") as cursor:
+                    total_cmds = (await cursor.fetchone())[0]
+
+            embed = discord.Embed(
+                title="⚙️ System Telemetry & Status",
+                color=discord.Color.teal()
+            )
+            embed.add_field(name="💻 CPU Usage", value=f"`{cpu_usage}%` ({cpu_count} Cores)", inline=False)
+            embed.add_field(name="🧠 RAM Usage", value=f"`{ram_used_mb} MB` / `{ram_total_mb} MB` (`{ram_percent}%`)", inline=False)
+            embed.add_field(name="💾 Disk Usage", value=f"`{disk_used_gb} GB` / `{disk_total_gb} GB` (`{disk_percent}%`)", inline=False)
+            embed.add_field(name="⏱️ System Uptime", value=f"`{hours}h {minutes}m {seconds}s`", inline=True)
+            embed.add_field(name="📜 Saved Commands", value=f"`{total_cmds}`", inline=True)
+            embed.add_field(name="💬 Mentions Handled", value=f"`{PROCESSED_MESSAGES_COUNT}`", inline=True)
+            embed.set_footer(text=f"Requested by {message.author.display_name}", icon_url=message.author.display_avatar.url)
+            
+            await message.reply(embed=embed)
+            return
+
+        # B. Backend Secrecy Interceptor
         if any(keyword in lower_prompt for keyword in SECRET_KEYWORDS):
             embed = discord.Embed(
                 title="🔒 Classified Information",
-                description="My core backend architecture, API configurations, and developer identities are classified. That information is secret!",
+                description="My core backend architecture, API configurations, and developer details are classified. That information is secret!",
                 color=discord.Color.dark_purple()
             )
             await message.reply(embed=embed, mention_author=True)
             return
 
-        # B. Custom Command Creation Handler
+        # C. Image Generation Handler (@ChatBot create image of <prompt>)
+        if lower_prompt.startswith("create image of") or lower_prompt.startswith("generate image of") or lower_prompt.startswith("image of"):
+            if not ai_client:
+                await message.reply("❌ AI Client configuration missing.")
+                return
+
+            img_prompt = raw_prompt.replace("create image of", "").replace("generate image of", "").replace("image of", "").strip()
+
+            if not img_prompt:
+                await message.reply("⚠️ Please provide an image prompt! Example: `@ChatBot create image of a futuristic neon city`")
+                return
+
+            async with message.channel.typing():
+                try:
+                    loop = asyncio.get_running_loop()
+                    result = await loop.run_in_executor(
+                        None,
+                        lambda: ai_client.models.generate_images(
+                            model=IMAGE_MODEL_NAME,
+                            prompt=img_prompt,
+                            config=types.GenerateImagesConfig(
+                                number_of_images=1,
+                                aspect_ratio="1:1"
+                            )
+                        )
+                    )
+
+                    if result.generated_images:
+                        generated = result.generated_images[0]
+                        image_bytes = generated.image.image_bytes
+
+                        pil_img = Image.open(io.BytesIO(image_bytes))
+                        buffer = io.BytesIO()
+                        pil_img.save(buffer, format="PNG")
+                        buffer.seek(0)
+
+                        file = discord.File(fp=buffer, filename="generated_image.png")
+                        embed = discord.Embed(
+                            title="🎨 Image Generated",
+                            description=f"**Prompt:** {img_prompt}",
+                            color=discord.Color.purple()
+                        )
+                        embed.set_image(url="attachment://generated_image.png")
+                        embed.set_footer(text=f"Requested by {message.author.display_name}", icon_url=message.author.display_avatar.url)
+
+                        await message.reply(embed=embed, file=file)
+                        return
+                    else:
+                        await message.reply("⚠️ Failed to generate image.")
+                        return
+
+                except Exception as e:
+                    logger.error(f"Image Generation Error: {e}", exc_info=True)
+                    await message.reply(f"❌ Failed to generate image: `{str(e)[:200]}`")
+                    return
+
+        # D. Custom Command Creation Handler
         if lower_prompt.startswith("create /") or lower_prompt.startswith("create command"):
+            # Enforce 'Ban Members' permission check
             if isinstance(message.author, discord.Member) and not message.author.guild_permissions.ban_members and message.author.id != BOT_OWNER_ID:
                 await message.reply(f"{message.author.mention} you don't have permission to create commands", mention_author=True)
                 return
@@ -226,7 +328,7 @@ async def on_message(message: discord.Message):
                 await message.reply("❌ Format error! Usage:\n`@ChatBot create /cmd_name title: Your Title desc: Your Description perm: ban_members`")
                 return
 
-        # C. Delete Command Handler
+        # E. Delete Command Handler
         if lower_prompt.startswith("delete /") or lower_prompt.startswith("delcmd /") or lower_prompt.startswith("delete command"):
             if isinstance(message.author, discord.Member) and not message.author.guild_permissions.ban_members and message.author.id != BOT_OWNER_ID:
                 await message.reply(f"{message.author.mention} you don't have permission to delete commands", mention_author=True)
@@ -253,7 +355,7 @@ async def on_message(message: discord.Message):
                 await message.reply("❌ Usage to delete: `@ChatBot delete /command_name`")
                 return
 
-        # D. List Commands Handler
+        # F. List Commands Handler
         if lower_prompt in ["listcmds", "commands", "list commands"]:
             async with aiosqlite.connect(DB_NAME) as db:
                 async with db.execute(
@@ -271,50 +373,31 @@ async def on_message(message: discord.Message):
             await message.reply(embed=embed)
             return
 
-        # E. System Stats Handler
-        if lower_prompt in ["stats", "system stats", "status"]:
-            uptime_seconds = int(time.time() - bot.start_time)
-            hours, remainder = divmod(uptime_seconds, 3600)
-            minutes, seconds = divmod(remainder, 60)
-
-            async with aiosqlite.connect(DB_NAME) as db:
-                async with db.execute("SELECT COUNT(*) FROM custom_commands") as cursor:
-                    total_cmds = (await cursor.fetchone())[0]
-
-            embed = discord.Embed(title="📊 Bot Runtime Statistics", color=discord.Color.teal())
-            embed.add_field(name="Uptime", value=f"`{hours}h {minutes}m {seconds}s`", inline=True)
-            embed.add_field(name="Active Chat Threads", value=f"`{len(bot.user_memory)}`", inline=True)
-            embed.add_field(name="Total Custom Commands", value=f"`{total_cmds}`", inline=True)
-            embed.add_field(name="Mentions Handled", value=f"`{bot.processed_messages}`", inline=True)
-            embed.set_footer(text=f"Requested by {message.author.display_name}", icon_url=message.author.display_avatar.url)
-            await message.reply(embed=embed)
-            return
-
-        # F. Memory Reset
+        # G. Reset Context Memory Thread
         if lower_prompt in ["reset", "clear"]:
-            if user_id in bot.user_memory:
-                del bot.user_memory[user_id]
+            if user_id in USER_MEMORY:
+                del USER_MEMORY[user_id]
                 await message.reply("🧹 Context history thread wiped!")
             else:
                 await message.reply("No active history thread found.")
             return
 
-        # G. Core AI Text Generation Request
-        if not bot.ai_client:
+        # H. Core AI Text Generation Request
+        if not ai_client:
             await message.reply("❌ API configuration missing in environment variables.")
             return
 
         async with message.channel.typing():
-            if user_id not in bot.user_memory:
-                bot.user_memory[user_id] = []
+            if user_id not in USER_MEMORY:
+                USER_MEMORY[user_id] = []
 
-            bot.user_memory[user_id].append({"role": "user", "text": raw_prompt})
+            USER_MEMORY[user_id].append({"role": "user", "text": raw_prompt})
 
-            if len(bot.user_memory[user_id]) > bot.max_memory_turns:
-                bot.user_memory[user_id] = bot.user_memory[user_id][-bot.max_memory_turns:]
+            if len(USER_MEMORY[user_id]) > MAX_MEMORY_TURNS:
+                USER_MEMORY[user_id] = USER_MEMORY[user_id][-MAX_MEMORY_TURNS:]
 
             formatted_prompt = ""
-            for msg in bot.user_memory[user_id]:
+            for msg in USER_MEMORY[user_id]:
                 role_label = "User" if msg["role"] == "user" else "Assistant"
                 formatted_prompt += f"{role_label}: {msg['text']}\n"
             formatted_prompt += "Assistant:"
@@ -323,7 +406,7 @@ async def on_message(message: discord.Message):
                 loop = asyncio.get_running_loop()
                 response = await loop.run_in_executor(
                     None,
-                    lambda: bot.ai_client.models.generate_content(
+                    lambda: ai_client.models.generate_content(
                         model=MODEL_NAME,
                         contents=formatted_prompt,
                         config=types.GenerateContentConfig(
@@ -333,7 +416,7 @@ async def on_message(message: discord.Message):
                 )
 
                 ai_reply = response.text.strip() if (response and response.text) else "No response generated."
-                bot.user_memory[user_id].append({"role": "model", "text": ai_reply})
+                USER_MEMORY[user_id].append({"role": "model", "text": ai_reply})
 
                 if len(ai_reply) <= 4000:
                     embed = discord.Embed(description=ai_reply, color=discord.Color.blurple())
@@ -350,8 +433,8 @@ async def on_message(message: discord.Message):
 
             except Exception as e:
                 logger.error(f"API Generation Exception: {e}", exc_info=True)
-                if bot.user_memory[user_id] and bot.user_memory[user_id][-1]["role"] == "user":
-                    bot.user_memory[user_id].pop()
+                if USER_MEMORY[user_id] and USER_MEMORY[user_id][-1]["role"] == "user":
+                    USER_MEMORY[user_id].pop()
 
                 err_embed = discord.Embed(
                     title="⚠️ Generation Error",
@@ -359,6 +442,7 @@ async def on_message(message: discord.Message):
                     color=discord.Color.red()
                 )
                 await message.reply(embed=err_embed)
+
 
 # -------------------------------------------------------------------
 # APPLICATION ENTRYPOINT
@@ -368,4 +452,3 @@ if __name__ == "__main__":
         logger.critical("DISCORD_TOKEN environment variable is missing!")
     else:
         bot.run(DISCORD_TOKEN)
-            
