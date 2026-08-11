@@ -1,6 +1,6 @@
 discord.py
-google-genai
-python-dotenv
+openai
 aiosqlite
 psutil
 Pillow
+
