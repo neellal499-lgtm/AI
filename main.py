@@ -1,103 +1,161 @@
 import os
+import asyncio
+import logging
 import discord
 from discord.ext import commands
 from google import genai
 
-# Load tokens securely from Railway environment variables
+# Configure logging for debugging inside Railway / Termux
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+
+# Load Environment Variables
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# Initialize Google GenAI client
-ai_client = genai.Client(api_key=GEMINI_API_KEY)
+# Initialize Gemini Client with explicit API key
+if not GEMINI_API_KEY:
+    logging.critical("GEMINI_API_KEY variable is missing!")
+ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
-# Set up required Discord intents
+# Memory storage to hold recent chat history per user
+# Structure: { user_id: [ {"role": "user"/"model", "text": "..."}, ... ] }
+USER_MEMORY = {}
+MAX_MEMORY_HISTORY = 6  # Keeps last 3 turns of conversation
+
+# Configure Discord Bot Gateway Intents
 intents = discord.Intents.default()
-intents.message_content = True  # Allows reading message text for @bot mentions
+intents.message_content = True  # Required to read text in @mentions
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 
 @bot.event
 async def on_ready():
-    print(f"✅ Bot successfully logged in as {bot.user} (ID: {bot.user.id})")
+    logging.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
+    await bot.change_presence(
+        activity=discord.Activity(
+            type=discord.ActivityType.listening, 
+            name="@ChatBot <question>"
+        )
+    )
+
+
+@bot.command(name="clear")
+async def clear_memory(ctx):
+    """Command to reset the user's AI conversation memory."""
+    user_id = ctx.author.id
+    if user_id in USER_MEMORY:
+        del USER_MEMORY[user_id]
+        await ctx.reply("🧹 Your conversation memory has been cleared!")
+    else:
+        await ctx.reply("You don't have any active conversation history.")
 
 
 @bot.event
 async def on_message(message):
-    # 1. Ignore messages sent by bots (including itself)
+    # Ignore messages sent by bots (including itself)
     if message.author.bot:
         return
 
-    # 2. Check if the bot was mentioned in the message
+    # Process standard prefix commands first (e.g., !clear)
+    await bot.process_commands(message)
+
+    # Check if the bot was mentioned in the channel
     if bot.user in message.mentions:
-        # Strip out the @bot mention tag from the text
-        question = (
+        # Strip out the mention tag from text
+        raw_prompt = (
             message.content.replace(f"<@{bot.user.id}>", "")
             .replace(f"<@!{bot.user.id}>", "")
             .strip()
         )
 
-        # Handle empty pings (user tags @bot with no question)
-        if not question:
-            await message.reply("Hey! Tag me and ask a question, like `@ChatBot What is Termux?`")
+        if not raw_prompt:
+            await message.reply("👋 Need help? Tag me with a question like `@ChatBot Explain quantum computing!`")
+            return
+
+        if not ai_client:
+            await message.reply("❌ Gemini API Key is missing. Check your Railway environment variables.")
             return
 
         async with message.channel.typing():
+            user_id = message.author.id
+
+            # Initialize user memory if not present
+            if user_id not in USER_MEMORY:
+                USER_MEMORY[user_id] = []
+
+            # Append current user prompt to history
+            USER_MEMORY[user_id].append({"role": "user", "text": raw_prompt})
+
+            # Trim history to maintain budget/context window
+            if len(USER_MEMORY[user_id]) > MAX_MEMORY_HISTORY:
+                USER_MEMORY[user_id] = USER_MEMORY[user_id][-MAX_MEMORY_HISTORY:]
+
+            # Construct full context prompt from history
+            formatted_prompt = ""
+            for msg in USER_MEMORY[user_id]:
+                prefix = "User" if msg["role"] == "user" else "Assistant"
+                formatted_prompt += f"{prefix}: {msg['text']}\n"
+            formatted_prompt += "Assistant:"
+
             try:
-                # Call Gemini API with gemini-1.5-flash
-                response = ai_client.models.generate_content(
-                    model="gemini-1.5-flash",
-                    contents=question
+                # Run API call in an async executor to avoid blocking the main event loop
+                loop = asyncio.get_running_loop()
+                response = await loop.run_in_executor(
+                    None,
+                    lambda: ai_client.models.generate_content(
+                        model="gemini-1.5-flash",
+                        contents=formatted_prompt
+                    )
                 )
 
-                ai_reply = response.text if response.text else "No response generated."
+                ai_reply = response.text.strip() if response and response.text else "I couldn't generate a text response."
 
-                # Discord embed description limit is 4096 characters
-                if len(ai_reply) > 4000:
-                    ai_reply = ai_reply[:4000] + "\n\n*(Response truncated due to length)*"
+                # Save model response back to memory
+                USER_MEMORY[user_id].append({"role": "model", "text": ai_reply})
 
-                # 3. Create response Embed
-                embed = discord.Embed(
-                    title="🤖 AI Assistant",
-                    description=ai_reply,
-                    color=discord.Color.blue()
-                )
-                
-                # Add user question field and requestor footer
-                embed.add_field(
-                    name="Question",
-                    value=question[:1024],
-                    inline=False
-                )
-                embed.set_footer(
-                    text=f"Requested by {message.author.display_name}",
-                    icon_url=message.author.display_avatar.url
-                )
-
-                # Send embed reply
-                await message.reply(embed=embed, mention_author=True)
+                # Discord Embed limit is 4096 characters in description
+                if len(ai_reply) <= 4000:
+                    embed = discord.Embed(
+                        description=ai_reply,
+                        color=discord.Color.blurple()
+                    )
+                    embed.set_author(name="AI Assistant", icon_url=bot.user.display_avatar.url)
+                    embed.set_footer(
+                        text=f"Requested by {message.author.display_name} • Type !clear to reset memory",
+                        icon_url=message.author.display_avatar.url
+                    )
+                    await message.reply(embed=embed, mention_author=True)
+                else:
+                    # Split long answers into 2000-character plain text chunks
+                    chunks = [ai_reply[i:i + 1900] for i in range(0, len(ai_reply), 1900)]
+                    for idx, chunk in enumerate(chunks):
+                        if idx == 0:
+                            await message.reply(f"**AI Response (Part {idx + 1}):**\n{chunk}")
+                        else:
+                            await message.channel.send(f"**Part {idx + 1}:**\n{chunk}")
 
             except Exception as e:
-                # Print exact error trace to Railway deployment logs for easy debugging
-                print(f"[ERROR] Gemini API call failed: {e}")
+                logging.error(f"Gemini API Execution Error: {e}", exc_info=True)
+                
+                # Rollback user's failed prompt from memory
+                if USER_MEMORY[user_id] and USER_MEMORY[user_id][-1]["role"] == "user":
+                    USER_MEMORY[user_id].pop()
 
                 err_embed = discord.Embed(
-                    title="❌ Error",
-                    description="Failed to generate a response. Please check Railway logs or API key.",
+                    title="⚠️ Generation Error",
+                    description=f"An error occurred while contacting the AI model:\n`{str(e)[:300]}`",
                     color=discord.Color.red()
                 )
                 await message.reply(embed=err_embed)
 
-    # Process standard prefix commands (e.g., !ping)
-    await bot.process_commands(message)
 
-
-# Start the bot
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
-        print("[CRITICAL] DISCORD_TOKEN variable is missing from environment variables!")
-    elif not GEMINI_API_KEY:
-        print("[CRITICAL] GEMINI_API_KEY variable is missing from environment variables!")
+        logging.critical("DISCORD_TOKEN environment variable not set. Exiting.")
     else:
         bot.run(DISCORD_TOKEN)
         
